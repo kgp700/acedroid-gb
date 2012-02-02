@@ -189,9 +189,8 @@ SUBARCH := $(shell uname -m | sed -e s/i.86/i386/ -e s/sun4u/sparc64/ \
 # Note: Some architectures assign CROSS_COMPILE in their arch/*/Makefile
 SUBARCH := arm
 export KBUILD_BUILDHOST := $(SUBARCH)
-ARCH		?= $(SUBARCH)
-CROSS_COMPILE	?= arm-eabi-
-CROSS_COMPILE	?= $(CONFIG_CROSS_COMPILE:"%"=%)
+ARCH		?= arm
+CROSS_COMPILE	?= /root/1test/toolchain/arm-eabi-4.5.4/bin/arm-eabi-
 
 # Architecture as present in compile.h
 UTS_MACHINE 	:= $(ARCH)
@@ -337,8 +336,8 @@ MODFLAGS	= -DMODULE
 CFLAGS_MODULE   = $(MODFLAGS)
 AFLAGS_MODULE   = $(MODFLAGS)
 LDFLAGS_MODULE  = -T $(srctree)/scripts/module-common.lds
-CFLAGS_KERNEL	=
-AFLAGS_KERNEL	=
+CFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fsingle-precision-constant -ftree-vectorize -funswitch-loops -fforce-addr -fprofile-correction -falign-loops -fpredictive-commoning -fgcse-after-reload -pipe
+AFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fsingle-precision-constant -ftree-vectorize -funswitch-loops -fforce-addr -fprofile-correction -falign-loops -fpredictive-commoning -fgcse-after-reload -pipe
 CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage
 
 
@@ -354,7 +353,11 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -fno-strict-aliasing -fno-common \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
-		   -fno-delete-null-pointer-checks
+		   -fno-delete-null-pointer-checks \
+		   -mtune=cortex-a8 -march=armv7-a -mfpu=neon \
+		   -fsingle-precision-constant -ftree-vectorize -funswitch-loops \
+		   -fforce-addr -fprofile-correction -falign-loops \
+	   	   -fpredictive-commoning -fgcse-after-reload -pipe
 KBUILD_AFLAGS   := -D__ASSEMBLY__
 
 # Read KERNELRELEASE from include/config/kernel.release (if it exists)
@@ -537,7 +540,7 @@ ifdef CONFIG_CC_OPTIMIZE_DEFAULT
 KBUILD_CFLAGS	+= -O2
 endif
 ifdef CONFIG_CC_OPTIMIZE_ALOT
-KBUILD_CFLAGS	+= -O3
+KBUILD_CFLAGS	+= -O2
 endif
 
 include $(srctree)/arch/$(SRCARCH)/Makefile
@@ -572,11 +575,6 @@ endif
 # We trigger additional mismatches with less inlining
 ifdef CONFIG_DEBUG_SECTION_MISMATCH
 KBUILD_CFLAGS += $(call cc-option, -fno-inline-functions-called-once)
-endif
-
-# Force warning message as hard error
-ifdef CONFIG_FORCE_WARNING_AS_ERROR
-KBUILD_CFLAGS += -Werror
 endif
 
 # arch Makefile may override CC so keep this after arch Makefile is included
