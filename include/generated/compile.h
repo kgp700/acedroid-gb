@@ -1,8 +1,8 @@
-/* This file is auto generated, version 1 */
+/* This file is auto generated, version 2 */
 /*  PREEMPT */
 #define UTS_MACHINE "arm"
-#define UTS_VERSION "#1 PREEMPT Thu Feb 2 19:12:52 KST 2012"
-#define LINUX_COMPILE_TIME "19:12:52"
+#define UTS_VERSION "#2 PREEMPT Thu Feb 2 19:40:35 KST 2012"
+#define LINUX_COMPILE_TIME "19:40:35"
 #define LINUX_COMPILE_BY "root"
 #define LINUX_COMPILE_HOST "KGPNeok-Nexroid-Dev"
 #define LINUX_COMPILE_DOMAIN "(none)"
