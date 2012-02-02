@@ -1,0 +1,12 @@
+.config
+.config.old
+.version
+include/config/auto.conf
+include/config/kernel.release
+include/config/tristate.conf
+include/generated/autoconf.h
+include/generated/compile.h
+include/generated/utsrelease.h
+include/config/cpu/freq/gov/*.*
+include/config/default/*.*
+include/config/iosched/*.*
