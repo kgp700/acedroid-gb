@@ -15,7 +15,7 @@
  * Author: Erasmux
  *
  * Based on the interactive governor By Mike Chan (mike@android.com)
- * which was adaptated to 2.6.29 kernel by Nadlabak (pavel@doshaska.net)
+ * which was adaptated to 2.6.29 kernel by Nadlabak (pavel@doshaska.net)                     
  * 
  * requires to add
  * EXPORT_SYMBOL_GPL(nr_running);
@@ -62,14 +62,14 @@ static unsigned int suspended;
  * The minimum amount of time to spend at a frequency before we can ramp down,
  * default is 45ms.
  */
-#define DEFAULT_DOWN_RATE_US 45000
+#define DEFAULT_DOWN_RATE_US 40000;
 static unsigned long down_rate_us;
 
 /*
  * When ramping up frequency with no idle cycles jump to at least this frequency.
  * Zero disables. Set a very high value to jump to policy max freqeuncy.
  */
-#define DEFAULT_UP_MIN_FREQ 0
+#define DEFAULT_UP_MIN_FREQ 999999
 static unsigned int up_min_freq;
 
 /*
@@ -78,7 +78,7 @@ static unsigned int up_min_freq;
  * to minimize wakeup issues.
  * Set sleep_max_freq=0 to disable this behavior.
  */
-#define DEFAULT_SLEEP_MAX_FREQ 499200
+#define DEFAULT_SLEEP_MAX_FREQ 230400
 static unsigned int sleep_max_freq;
 
 /*
@@ -91,7 +91,7 @@ static unsigned int sample_rate_jiffies;
  * Freqeuncy delta when ramping up.
  * zero disables causes to always jump straight to max frequency.
  */
-#define DEFAULT_RAMP_UP_STEP 70000
+#define DEFAULT_RAMP_UP_STEP 128000
 static unsigned int ramp_up_step;
 
 /*
@@ -122,7 +122,7 @@ static
 struct cpufreq_governor cpufreq_gov_smartass = {
 	.name = "smartass",
 	.governor = cpufreq_governor_smartass,
-	.max_transition_latency = 6000000,
+	.max_transition_latency = 7000000,
 	.owner = THIS_MODULE,
 };
 
@@ -223,7 +223,7 @@ static unsigned int cpufreq_smartass_calc_freq(unsigned int cpu, struct cpufreq_
 	//printk(KERN_INFO "Smartass calc_freq: delta_time=%u cpu_load=%u\n",delta_time,cpu_load);
 	if (cpu_load < min_cpu_load) {
 		cpu_load += 100 - max_cpu_load; // dummy load.
-		new_freq = policy->cur * cpu_load / 100;
+		new_freq = policy->cur * cpu_load / 73;
 		if (max_ramp_down && new_freq < policy->cur - max_ramp_down)
 			new_freq = policy->cur - max_ramp_down;
 		//printk(KERN_INFO "Smartass calc_freq: %u => %u\n",policy->cur,new_freq);
@@ -314,7 +314,7 @@ static ssize_t store_down_rate_us(struct cpufreq_policy *policy, const char *buf
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input >= 1000 && input <= 100000000)
 	  down_rate_us = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr down_rate_us_attr = __ATTR(down_rate_us, 0644,
@@ -332,7 +332,7 @@ static ssize_t store_up_min_freq(struct cpufreq_policy *policy, const char *buf,
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input >= 0)
 	  up_min_freq = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr up_min_freq_attr = __ATTR(up_min_freq, 0644,
@@ -350,7 +350,7 @@ static ssize_t store_sleep_max_freq(struct cpufreq_policy *policy, const char *b
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input >= 0)
 	  sleep_max_freq = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr sleep_max_freq_attr = __ATTR(sleep_max_freq, 0644,
@@ -368,7 +368,7 @@ static ssize_t store_sample_rate_jiffies(struct cpufreq_policy *policy, const ch
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input > 0 && input <= 1000)
 	  sample_rate_jiffies = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr sample_rate_jiffies_attr = __ATTR(sample_rate_jiffies, 0644,
@@ -386,7 +386,7 @@ static ssize_t store_ramp_up_step(struct cpufreq_policy *policy, const char *buf
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0)
 	  ramp_up_step = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr ramp_up_step_attr = __ATTR(ramp_up_step, 0644,
@@ -404,7 +404,7 @@ static ssize_t store_max_ramp_down(struct cpufreq_policy *policy, const char *bu
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0)
 	  max_ramp_down = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr max_ramp_down_attr = __ATTR(max_ramp_down, 0644,
@@ -422,7 +422,7 @@ static ssize_t store_max_cpu_load(struct cpufreq_policy *policy, const char *buf
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input > 0 && input <= 100)
 	  max_cpu_load = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr max_cpu_load_attr = __ATTR(max_cpu_load, 0644,
@@ -440,7 +440,7 @@ static ssize_t store_min_cpu_load(struct cpufreq_policy *policy, const char *buf
 	res = strict_strtoul(buf, 0, &input);
 	if (res >= 0 && input > 0 && input < 100)
 	  min_cpu_load = input;
-	return res;
+	return count;
 }
 
 static struct freq_attr min_cpu_load_attr = __ATTR(min_cpu_load, 0644,
@@ -492,9 +492,6 @@ static int cpufreq_governor_smartass(struct cpufreq_policy *new_policy,
 		pm_idle = cpufreq_idle;
 
 		this_smartass->cur_policy = new_policy;
-		this_smartass->cur_policy->max = CONFIG_MSM_CPU_FREQ_ONDEMAND_MAX;
-		this_smartass->cur_policy->min = CONFIG_MSM_CPU_FREQ_ONDEMAND_MIN;
-		this_smartass->cur_policy->cur = CONFIG_MSM_CPU_FREQ_ONDEMAND_MAX;
 		this_smartass->enable = 1;
 
 		// notice no break here!
@@ -621,5 +618,5 @@ static void __exit cpufreq_smartass_exit(void)
 module_exit(cpufreq_smartass_exit);
 
 MODULE_AUTHOR ("Erasmux");
-MODULE_DESCRIPTION ("'cpufreq_smartass' - A smart cpufreq governor");
+MODULE_DESCRIPTION ("'cpufreq_minmax' - A smart cpufreq governor optimized for the hero!");
 MODULE_LICENSE ("GPL");
