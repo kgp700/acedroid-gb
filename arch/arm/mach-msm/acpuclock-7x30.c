@@ -56,7 +56,7 @@
 #define PLL2_L_VAL_ADDR  (MSM_CLK_CTL_BASE + 0x33c)
 
 #define ACE_ACPU_MIN_UV_MV 750U
-#ifdef CONFIG_NUTTER
+#ifdef CONFIG_NEOKOC
 #define ACE_ACPU_MAX_UV_MV 1500U
 #else
 #define ACE_ACPU_MAX_UV_MV 1350U
@@ -105,14 +105,15 @@ static struct cpufreq_frequency_table freq_table[] = {
 	{ 15, 1344000 },
 	{ 16, 1420800 },
 	{ 17, 1497600 },
-#ifndef CONFIG_NUTTER
-	{ 18, CPUFREQ_TABLE_END },
-#else //CONFIG_NUTTER
-	{ 19, 1574400 },
-	{ 20, 1651200 },
-	{ 21, 1728000 },
-	{ 22, 1804800 },
-	{ 23, CPUFREQ_TABLE_END },
+	{ 18, 1536000 },
+	{ 29, 1612800 },
+	{ 20, 1689600 },
+	{ 21, 1766400 },
+#ifdef CONFIG_NEOKOC
+	{ 23, 1843200 },
+	{ 24, CPUFREQ_TABLE_END },
+#else
+	{ 24, CPUFREQ_TABLE_END },
 #endif
 };
 
@@ -145,12 +146,13 @@ static struct clkctl_acpu_speed acpu_freq_tbl[] = {
 	{ 1344000, PLL_2,   3, 0,  192000, 1175, VDD_RAW(1175) },
 	{ 1420800, PLL_2,   3, 0,  192000, 1200, VDD_RAW(1200) },
 	{ 1497600, PLL_2,   3, 0,  192000, 1275, VDD_RAW(1275) },
-#ifdef CONFIG_NUTTER
-	{ 1574400, PLL_2,   3, 0,  192000, 1300, VDD_RAW(1300) },
-	{ 1651200, PLL_2,   3, 0,  192000, 1375, VDD_RAW(1375) },
-	{ 1728000, PLL_2,   3, 0,  192000, 1400, VDD_RAW(1400) },
-	{ 1804800, PLL_2,   3, 0,  192000, 1425, VDD_RAW(1425) },
-#endif //CONFIG_NUTTER
+	{ 1536000, PLL_2,   3, 0, 192000, 1300, VDD_RAW(1300) },
+	{ 1612800, PLL_2,   3, 0, 192000, 1325, VDD_RAW(1325) },
+	{ 1689600, PLL_2,   3, 0, 192000, 1375, VDD_RAW(1375) },
+	{ 1766400, PLL_2,   3, 0, 192000, 1425, VDD_RAW(1425) },
+#ifdef CONFIG_NEOKOC
+	{ 1843200, PLL_2,   3, 0, 192000, 1450, VDD_RAW(1450) },
+#endif //CONFIG_NEOKOC
 	{ 0 }
 };
 static unsigned long max_axi_rate;
