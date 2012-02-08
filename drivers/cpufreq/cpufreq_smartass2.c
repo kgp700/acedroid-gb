@@ -52,7 +52,7 @@ static unsigned int awake_ideal_freq;
  * that practically when sleep_ideal_freq==0 the awake_ideal_freq is used
  * also when suspended).
  */
-#define DEFAULT_SLEEP_IDEAL_FREQ 122000
+#define DEFAULT_SLEEP_IDEAL_FREQ 230400
 static unsigned int sleep_ideal_freq;
 
 /*
@@ -675,9 +675,7 @@ static int cpufreq_governor_smartass(struct cpufreq_policy *new_policy,
 			return -EINVAL;
 
 		this_smartass->cur_policy = new_policy;
-		this_smartass->cur_policy->max = CONFIG_MSM_CPU_FREQ_ONDEMAND_MAX;
-		this_smartass->cur_policy->min = CONFIG_MSM_CPU_FREQ_ONDEMAND_MIN;
-		this_smartass->cur_policy->cur = CONFIG_MSM_CPU_FREQ_ONDEMAND_MAX;
+
 		this_smartass->enable = 1;
 
 		smartass_update_min_max(this_smartass,new_policy,suspended);
