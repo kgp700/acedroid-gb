@@ -106,7 +106,7 @@ static struct cpufreq_frequency_table freq_table[] = {
 	{ 16, 1420800 },
 	{ 17, 1497600 },
 	{ 18, 1536000 },
-	{ 29, 1612800 },
+	{ 19, 1612800 },
 	{ 20, 1689600 },
 	{ 21, 1766400 },
 #ifdef CONFIG_NEOKOC
