@@ -1,857 +1,750 @@
 /*
- *  drivers/cpufreq/cpufreq_neokdemand.c
+ * drivers/cpufreq/cpufreq_neokdemand.c
  *
- *  Copyright (C)  2001 Russell King
- *            (C)  2003 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
- *                      Jun Nakajima <jun.nakajima@intel.com>
+ * Copyright (C) 2010 Google, Inc.
  *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License version 2 as
- * published by the Free Software Foundation.
+ * This software is licensed under the terms of the GNU General Public
+ * License version 2, as published by the Free Software Foundation, and
+ * may be copied, distributed, and modified under those terms.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * Author: Joshua Seidel
+
+ * Based on the smartass governor by Erasmux
+ *
+ * Based on the interactive governor By Mike Chan (mike@android.com)
+ * which was adaptated to 2.6.29 kernel by Nadlabak (pavel@doshaska.net)
+ *
+ * requires to add
+ * EXPORT_SYMBOL_GPL(nr_running);
+ * at the end of kernel/sched.c
+ *
  */
 
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/cpufreq.h>
 #include <linux/cpu.h>
-#include <linux/jiffies.h>
-#include <linux/kernel_stat.h>
-#include <linux/mutex.h>
-#include <linux/hrtimer.h>
-#include <linux/tick.h>
-#include <linux/ktime.h>
+#include <linux/cpumask.h>
+#include <linux/cpufreq.h>
 #include <linux/sched.h>
+#include <linux/tick.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h>
+#include <linux/moduleparam.h>
+#include <asm/cputime.h>
+#include <linux/earlysuspend.h>
+
+static void (*pm_idle_old)(void);
+static atomic_t active_count = ATOMIC_INIT(0);
+
+struct neokdemand_info_s {
+        struct cpufreq_policy *cur_policy;
+        struct timer_list timer;
+        u64 time_in_idle;
+        u64 idle_exit_time;
+        u64 freq_change_time;
+        u64 freq_change_time_in_idle;
+        int cur_cpu_load;
+        unsigned int force_ramp_up;
+        unsigned int enable;
+        int max_speed;
+        int min_speed;
+};
+static DEFINE_PER_CPU(struct neokdemand_info_s, neokdemand_info);
+
+/* Workqueues handle frequency scaling */
+static struct workqueue_struct *up_wq;
+static struct workqueue_struct *down_wq;
+static struct work_struct freq_scale_work;
+
+static cpumask_t work_cpumask;
+static unsigned int suspended;
+
+enum {
+        neokdemand_DEBUG_JUMPS=1,
+        neokdemand_DEBUG_LOAD=2
+};
 
 /*
- * dbs is used in this file as a shortform for demandbased switching
- * It helps to keep variable names smaller, simpler
+ * Combination of the above debug flags.
  */
-
-#define DEF_FREQUENCY_DOWN_DIFFERENTIAL		(10)
-#define DEF_FREQUENCY_UP_THRESHOLD		(80)
-#define MICRO_FREQUENCY_DOWN_DIFFERENTIAL	(3)
-#define MICRO_FREQUENCY_UP_THRESHOLD		(95)
-#define MICRO_FREQUENCY_MIN_SAMPLE_RATE		(95000)
-#define MIN_FREQUENCY_UP_THRESHOLD		(11)
-#define MAX_FREQUENCY_UP_THRESHOLD		(100)
+static unsigned long debug_mask;
 
 /*
- * The polling frequency of this governor depends on the capability of
- * the processor. Default polling frequency is 1000 times the transition
- * latency of the processor. The governor will work on any processor with
- * transition latency <= 10mS, using appropriate sampling
- * rate.
- * For CPUs with transition latency > 10mS (mostly drivers with CPUFREQ_ETERNAL)
- * this governor will not work.
- * All times here are in uS.
+ * The minimum amount of time to spend at a frequency before we can ramp up.
  */
-#define MIN_SAMPLING_RATE_RATIO			(2)
+#define DEFAULT_UP_RATE_US 70000;
+static unsigned long up_rate_us;
 
-static unsigned int min_sampling_rate;
+/*
+ * The minimum amount of time to spend at a frequency before we can ramp down.
+ */
+#define DEFAULT_DOWN_RATE_US 50000;
+static unsigned long down_rate_us;
 
-#define LATENCY_MULTIPLIER			(1000)
-#define MIN_LATENCY_MULTIPLIER			(100)
-#define TRANSITION_LATENCY_LIMIT		(10 * 1000 * 1000)
+/*
+ * When ramping up frequency with no idle cycles jump to at least this frequency.
+ * Zero disables. Set a very high value to jump to policy max freqeuncy.
+ */
+#define DEFAULT_UP_MIN_FREQ 999999
+static unsigned int up_min_freq;
 
-static void do_dbs_timer(struct work_struct *work);
-static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
-				unsigned int event);
+/*
+ * When sleep_max_freq>0 the frequency when suspended will be capped
+ * by this frequency. Also will wake up at max frequency of policy
+ * to minimize wakeup issues.
+ * Set sleep_max_freq=0 to disable this behavior.
+ */
+#define DEFAULT_SLEEP_MAX_FREQ 230400
+static unsigned int sleep_max_freq;
+
+/*
+ * The frequency to set when waking up from sleep.
+ * When sleep_max_freq=0 this will have no effect.
+ */
+#define DEFAULT_SLEEP_WAKEUP_FREQ 998000
+static unsigned int sleep_wakeup_freq;
+
+/*
+ * When awake_min_freq>0 the frequency when not suspended will not
+ * go below this frequency.
+ * Set awake_min_freq=0 to disable this behavior.
+ */
+#define DEFAULT_AWAKE_MIN_FREQ 122000
+static unsigned int awake_min_freq;
+
+/*
+ * Sampling rate, I highly recommend to leave it at 2.
+ */
+#define DEFAULT_SAMPLE_RATE_JIFFIES 32
+static unsigned int sample_rate_jiffies;
+
+/*
+ * Freqeuncy delta when ramping up.
+ * zero disables and causes to always jump straight to max frequency.
+ */
+#define DEFAULT_RAMP_UP_STEP 200000
+static unsigned int ramp_up_step;
+
+/*
+ * Freqeuncy delta when ramping down.
+ * zero disables and will calculate ramp down according to load heuristic.
+ */
+#define DEFAULT_RAMP_DOWN_STEP 500000
+static unsigned int ramp_down_step;
+
+/*
+ * CPU freq will be increased if measured load > max_cpu_load;
+ */
+#define DEFAULT_MAX_CPU_LOAD 70
+static unsigned long max_cpu_load;
+
+/*
+ * CPU freq will be decreased if measured load < min_cpu_load;
+ */
+#define DEFAULT_MIN_CPU_LOAD 63
+static unsigned long min_cpu_load;
+
+
+static int cpufreq_governor_neokdemand(struct cpufreq_policy *policy,
+                unsigned int event);
 
 #ifndef CONFIG_CPU_FREQ_DEFAULT_GOV_NEOKDEMAND
 static
 #endif
 struct cpufreq_governor cpufreq_gov_neokdemand = {
-       .name                   = "neokdemand",
-       .governor               = cpufreq_governor_dbs,
-       .max_transition_latency = TRANSITION_LATENCY_LIMIT,
-       .owner                  = THIS_MODULE,
+        .name = "neokdemand",
+        .governor = cpufreq_governor_neokdemand,
+        .max_transition_latency = 9000000,
+        .owner = THIS_MODULE,
 };
 
-/* Sampling types */
-enum {DBS_NORMAL_SAMPLE, DBS_SUB_SAMPLE};
+static void neokdemand_update_min_max(struct neokdemand_info_s *this_neokdemand, struct cpufreq_policy *policy, int suspend) {
+        if (suspend) {
+                this_neokdemand->min_speed = policy->min;
+                this_neokdemand->max_speed = // sleep_max_freq; but make sure it obeys the policy min/max
+                        policy->max > sleep_max_freq ? (sleep_max_freq > policy->min ? sleep_max_freq : policy->min) : policy->max;
+        } else {
+                this_neokdemand->min_speed = // awake_min_freq; but make sure it obeys the policy min/max
+                        policy->min < awake_min_freq ? (awake_min_freq < policy->max ? awake_min_freq : policy->max) : policy->min;
+                this_neokdemand->max_speed = policy->max;
+        }
+}
 
-struct cpu_dbs_info_s {
-	cputime64_t prev_cpu_idle;
-	cputime64_t prev_cpu_iowait;
-	cputime64_t prev_cpu_wall;
-	cputime64_t prev_cpu_nice;
-	struct cpufreq_policy *cur_policy;
-	struct delayed_work work;
-	struct cpufreq_frequency_table *freq_table;
-	unsigned int freq_lo;
-	unsigned int freq_lo_jiffies;
-	unsigned int freq_hi_jiffies;
-	int cpu;
-	unsigned int sample_type:1;
-	/*
-	 * percpu mutex that serializes governor limit change with
-	 * do_dbs_timer invocation. We do not want do_dbs_timer to run
-	 * when user is changing the governor or limits.
-	 */
-	struct mutex timer_mutex;
-};
-static DEFINE_PER_CPU(struct cpu_dbs_info_s, od_cpu_dbs_info);
+inline static unsigned int validate_freq(struct neokdemand_info_s *this_neokdemand, int freq) {
+        if (freq > this_neokdemand->max_speed)
+                return this_neokdemand->max_speed;
+        if (freq < this_neokdemand->min_speed)
+                return this_neokdemand->min_speed;
+        return freq;
+}
 
-static unsigned int dbs_enable;	/* number of CPUs using this policy */
+static void reset_timer(unsigned long cpu, struct neokdemand_info_s *this_neokdemand) {
+  this_neokdemand->time_in_idle = get_cpu_idle_time_us(cpu, &this_neokdemand->idle_exit_time);
+  mod_timer(&this_neokdemand->timer, jiffies + sample_rate_jiffies);
+}
 
-/*
- * dbs_mutex protects data in dbs_tuners_ins from concurrent changes on
- * different CPUs. It protects dbs_enable in governor start/stop.
- */
-static DEFINE_MUTEX(dbs_mutex);
-
-static struct workqueue_struct	*kneokdemand_wq;
-
-static struct dbs_tuners {
-	unsigned int sampling_rate;
-	unsigned int up_threshold;
-	unsigned int down_differential;
-	unsigned int ignore_nice;
-	unsigned int powersave_bias;
-	unsigned int io_is_busy;
-} dbs_tuners_ins = {
-	.up_threshold = DEF_FREQUENCY_UP_THRESHOLD,
-	.down_differential = DEF_FREQUENCY_DOWN_DIFFERENTIAL,
-	.ignore_nice = 0,
-	.powersave_bias = 35,
-};
-
-static inline cputime64_t get_cpu_idle_time_jiffy(unsigned int cpu,
-							cputime64_t *wall)
+static void cpufreq_neokdemand_timer(unsigned long data)
 {
-	cputime64_t idle_time;
-	cputime64_t cur_wall_time;
-	cputime64_t busy_time;
+        u64 delta_idle;
+        u64 delta_time;
+        int cpu_load;
+        u64 update_time;
+        u64 now_idle;
+        struct neokdemand_info_s *this_neokdemand = &per_cpu(neokdemand_info, data);
+        struct cpufreq_policy *policy = this_neokdemand->cur_policy;
 
-	cur_wall_time = jiffies64_to_cputime64(get_jiffies_64());
-	busy_time = cputime64_add(kstat_cpu(cpu).cpustat.user,
-			kstat_cpu(cpu).cpustat.system);
+        now_idle = get_cpu_idle_time_us(data, &update_time);
 
-	busy_time = cputime64_add(busy_time, kstat_cpu(cpu).cpustat.irq);
-	busy_time = cputime64_add(busy_time, kstat_cpu(cpu).cpustat.softirq);
-	busy_time = cputime64_add(busy_time, kstat_cpu(cpu).cpustat.steal);
-	busy_time = cputime64_add(busy_time, kstat_cpu(cpu).cpustat.nice);
+        if (this_neokdemand->idle_exit_time == 0 || update_time == this_neokdemand->idle_exit_time)
+                return;
 
-	idle_time = cputime64_sub(cur_wall_time, busy_time);
-	if (wall)
-		*wall = (cputime64_t)jiffies_to_usecs(cur_wall_time);
+        delta_idle = cputime64_sub(now_idle, this_neokdemand->time_in_idle);
+        delta_time = cputime64_sub(update_time, this_neokdemand->idle_exit_time);
+        //printk(KERN_INFO "neokdemandT: t=%llu i=%llu\n",cputime64_sub(update_time,this_neokdemand->idle_exit_time),delta_idle);
 
-	return (cputime64_t)jiffies_to_usecs(idle_time);
+        // If timer ran less than 1ms after short-term sample started, retry.
+        if (delta_time < 1000) {
+                if (!timer_pending(&this_neokdemand->timer))
+                        reset_timer(data,this_neokdemand);
+                return;
+        }
+
+        if (delta_idle > delta_time)
+                cpu_load = 0;
+        else
+                cpu_load = 100 * (unsigned int)(delta_time - delta_idle) / (unsigned int)delta_time;
+
+        if (debug_mask & neokdemand_DEBUG_LOAD)
+                printk(KERN_INFO "neokdemandT @ %d: load %d (delta_time %llu)\n",policy->cur,cpu_load,delta_time);
+
+        this_neokdemand->cur_cpu_load = cpu_load;
+
+        // Scale up if load is above max or if there where no idle cycles since coming out of idle.
+        if (cpu_load > max_cpu_load || delta_idle == 0) {
+                if (policy->cur == policy->max)
+                        return;
+
+                if (nr_running() < 1)
+                        return;
+
+                if (cputime64_sub(update_time, this_neokdemand->freq_change_time) < up_rate_us)
+                        return;
+
+
+                this_neokdemand->force_ramp_up = 1;
+                cpumask_set_cpu(data, &work_cpumask);
+                queue_work(up_wq, &freq_scale_work);
+                return;
+        }
+
+        /*
+         * There is a window where if the cpu utlization can go from low to high
+         * between the timer expiring, delta_idle will be > 0 and the cpu will
+         * be 100% busy, preventing idle from running, and this timer from
+         * firing. So setup another timer to fire to check cpu utlization.
+         * Do not setup the timer if there is no scheduled work or if at max speed.
+         */
+        if (policy->cur < this_neokdemand->max_speed && !timer_pending(&this_neokdemand->timer) && nr_running() > 0)
+                reset_timer(data,this_neokdemand);
+
+        if (policy->cur == policy->min)
+                return;
+
+        /*
+         * Do not scale down unless we have been at this frequency for the
+         * minimum sample time.
+         */
+        if (cputime64_sub(update_time, this_neokdemand->freq_change_time) < down_rate_us)
+                return;
+
+        cpumask_set_cpu(data, &work_cpumask);
+        queue_work(down_wq, &freq_scale_work);
 }
 
-static inline cputime64_t get_cpu_idle_time(unsigned int cpu, cputime64_t *wall)
+static void cpufreq_idle(void)
 {
-	u64 idle_time = get_cpu_idle_time_us(cpu, wall);
+        struct neokdemand_info_s *this_neokdemand = &per_cpu(neokdemand_info, smp_processor_id());
+        struct cpufreq_policy *policy = this_neokdemand->cur_policy;
 
-	if (idle_time == -1ULL)
-		return get_cpu_idle_time_jiffy(cpu, wall);
+        if (!this_neokdemand->enable) {
+                pm_idle_old();
+                return;
+        }
 
-	return idle_time;
+        if (policy->cur == this_neokdemand->min_speed && timer_pending(&this_neokdemand->timer))
+                del_timer(&this_neokdemand->timer);
+
+        pm_idle_old();
+
+        if (!timer_pending(&this_neokdemand->timer))
+                reset_timer(smp_processor_id(), this_neokdemand);
 }
 
-static inline cputime64_t get_cpu_iowait_time(unsigned int cpu, cputime64_t *wall)
+/* We use the same work function to sale up and down */
+static void cpufreq_neokdemand_freq_change_time_work(struct work_struct *work)
 {
-	u64 iowait_time = get_cpu_iowait_time_us(cpu, wall);
+        unsigned int cpu;
+        int new_freq;
+        unsigned int force_ramp_up;
+        int cpu_load;
+        struct neokdemand_info_s *this_neokdemand;
+        struct cpufreq_policy *policy;
+        unsigned int relation = CPUFREQ_RELATION_L;
+        cpumask_t tmp_mask = work_cpumask;
+        for_each_cpu(cpu, tmp_mask) {
+                this_neokdemand = &per_cpu(neokdemand_info, cpu);
+                policy = this_neokdemand->cur_policy;
+                cpu_load = this_neokdemand->cur_cpu_load;
+                force_ramp_up = this_neokdemand->force_ramp_up && nr_running() > 1;
+                this_neokdemand->force_ramp_up = 0;
 
-	if (iowait_time == -1ULL)
-		return 0;
+                if (force_ramp_up || cpu_load > max_cpu_load) {
+                        if (force_ramp_up && up_min_freq) {
+                                new_freq = up_min_freq;
+                                relation = CPUFREQ_RELATION_L;
+                        } else if (ramp_up_step) {
+                                new_freq = policy->cur + ramp_up_step;
+                                relation = CPUFREQ_RELATION_H;
+                        } else {
+                                new_freq = this_neokdemand->max_speed;
+                                relation = CPUFREQ_RELATION_H;
+                        }
+                }
+                else if (cpu_load < min_cpu_load) {
+                        if (ramp_down_step)
+                                new_freq = policy->cur - ramp_down_step;
+                        else {
+                                cpu_load += 100 - max_cpu_load; // dummy load.
+                                new_freq = policy->cur * cpu_load / 100;
+                        }
+                        relation = CPUFREQ_RELATION_L;
+                }
+                else new_freq = policy->cur;
 
-	return iowait_time;
+                new_freq = validate_freq(this_neokdemand,new_freq);
+
+                if (new_freq != policy->cur) {
+                        if (debug_mask & neokdemand_DEBUG_JUMPS)
+                                printk(KERN_INFO "neokdemandQ: jumping from %d to %d\n",policy->cur,new_freq);
+
+                        __cpufreq_driver_target(policy, new_freq, relation);
+
+                        this_neokdemand->freq_change_time_in_idle =
+                                get_cpu_idle_time_us(cpu,&this_neokdemand->freq_change_time);
+                }
+
+                cpumask_clear_cpu(cpu, &work_cpumask);
+        }
 }
 
-/*
- * Find right freq to be set now with powersave_bias on.
- * Returns the freq_hi to be used right now and will set freq_hi_jiffies,
- * freq_lo, and freq_lo_jiffies in percpu area for averaging freqs.
- */
-static unsigned int powersave_bias_target(struct cpufreq_policy *policy,
-					  unsigned int freq_next,
-					  unsigned int relation)
+static ssize_t show_debug_mask(struct cpufreq_policy *policy, char *buf)
 {
-	unsigned int freq_req, freq_reduc, freq_avg;
-	unsigned int freq_hi, freq_lo;
-	unsigned int index = 0;
-	unsigned int jiffies_total, jiffies_hi, jiffies_lo;
-	struct cpu_dbs_info_s *dbs_info = &per_cpu(od_cpu_dbs_info,
-						   policy->cpu);
-
-	if (!dbs_info->freq_table) {
-		dbs_info->freq_lo = 0;
-		dbs_info->freq_lo_jiffies = 0;
-		return freq_next;
-	}
-
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_next,
-			relation, &index);
-	freq_req = dbs_info->freq_table[index].frequency;
-	freq_reduc = freq_req * dbs_tuners_ins.powersave_bias / 1000;
-	freq_avg = freq_req - freq_reduc;
-
-	/* Find freq bounds for freq_avg in freq_table */
-	index = 0;
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_avg,
-			CPUFREQ_RELATION_H, &index);
-	freq_lo = dbs_info->freq_table[index].frequency;
-	index = 0;
-	cpufreq_frequency_table_target(policy, dbs_info->freq_table, freq_avg,
-			CPUFREQ_RELATION_L, &index);
-	freq_hi = dbs_info->freq_table[index].frequency;
-
-	/* Find out how long we have to be in hi and lo freqs */
-	if (freq_hi == freq_lo) {
-		dbs_info->freq_lo = 0;
-		dbs_info->freq_lo_jiffies = 0;
-		return freq_lo;
-	}
-	jiffies_total = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-	jiffies_hi = (freq_avg - freq_lo) * jiffies_total;
-	jiffies_hi += ((freq_hi - freq_lo) / 2);
-	jiffies_hi /= (freq_hi - freq_lo);
-	jiffies_lo = jiffies_total - jiffies_hi;
-	dbs_info->freq_lo = freq_lo;
-	dbs_info->freq_lo_jiffies = jiffies_lo;
-	dbs_info->freq_hi_jiffies = jiffies_hi;
-	return freq_hi;
+        return sprintf(buf, "%lu\n", debug_mask);
 }
 
-static void neokdemand_powersave_bias_init_cpu(int cpu)
+static ssize_t store_debug_mask(struct cpufreq_policy *policy, const char *buf, size_t count)
 {
-	struct cpu_dbs_info_s *dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-	dbs_info->freq_table = cpufreq_frequency_get_table(cpu);
-	dbs_info->freq_lo = 0;
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0)
+          debug_mask = input;
+        return res;
 }
 
-static void neokdemand_powersave_bias_init(void)
+static struct freq_attr debug_mask_attr = __ATTR(debug_mask, 0644,
+                show_debug_mask, store_debug_mask);
+
+static ssize_t show_up_rate_us(struct cpufreq_policy *policy, char *buf)
 {
-	int i;
-	for_each_online_cpu(i) {
-		neokdemand_powersave_bias_init_cpu(i);
-	}
+        return sprintf(buf, "%lu\n", up_rate_us);
 }
 
-/************************** sysfs interface ************************/
-
-static ssize_t show_sampling_rate_max(struct kobject *kobj,
-				      struct attribute *attr, char *buf)
+static ssize_t store_up_rate_us(struct cpufreq_policy *policy, const char *buf, size_t count)
 {
-	printk_once(KERN_INFO "CPUFREQ: neokdemand sampling_rate_max "
-	       "sysfs file is deprecated - used by: %s\n", current->comm);
-	return sprintf(buf, "%u\n", -1U);
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0 && input <= 100000000)
+          up_rate_us = input;
+        return res;
 }
 
-static ssize_t show_sampling_rate_min(struct kobject *kobj,
-				      struct attribute *attr, char *buf)
+static struct freq_attr up_rate_us_attr = __ATTR(up_rate_us, 0644,
+                show_up_rate_us, store_up_rate_us);
+
+static ssize_t show_down_rate_us(struct cpufreq_policy *policy, char *buf)
 {
-	return sprintf(buf, "%u\n", min_sampling_rate);
+        return sprintf(buf, "%lu\n", down_rate_us);
 }
 
-define_one_global_ro(sampling_rate_max);
-define_one_global_ro(sampling_rate_min);
-
-/* cpufreq_neokdemand Governor Tunables */
-#define show_one(file_name, object)					\
-static ssize_t show_##file_name						\
-(struct kobject *kobj, struct attribute *attr, char *buf)              \
-{									\
-	return sprintf(buf, "%u\n", dbs_tuners_ins.object);		\
-}
-show_one(sampling_rate, sampling_rate);
-show_one(io_is_busy, io_is_busy);
-show_one(up_threshold, up_threshold);
-show_one(down_differential, down_differential);
-show_one(ignore_nice_load, ignore_nice);
-show_one(powersave_bias, powersave_bias);
-
-/*** delete after deprecation time ***/
-
-#define DEPRECATION_MSG(file_name)					\
-	printk_once(KERN_INFO "CPUFREQ: Per core neokdemand sysfs "	\
-		    "interface is deprecated - " #file_name "\n");
-
-#define show_one_old(file_name)						\
-static ssize_t show_##file_name##_old					\
-(struct cpufreq_policy *unused, char *buf)				\
-{									\
-	printk_once(KERN_INFO "CPUFREQ: Per core neokdemand sysfs "	\
-		    "interface is deprecated - " #file_name "\n");	\
-	return show_##file_name(NULL, NULL, buf);			\
-}
-show_one_old(sampling_rate);
-show_one_old(up_threshold);
-show_one_old(ignore_nice_load);
-show_one_old(powersave_bias);
-show_one_old(sampling_rate_min);
-show_one_old(sampling_rate_max);
-
-cpufreq_freq_attr_ro_old(sampling_rate_min);
-cpufreq_freq_attr_ro_old(sampling_rate_max);
-
-/*** delete after deprecation time ***/
-
-static ssize_t store_sampling_rate(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
+static ssize_t store_down_rate_us(struct cpufreq_policy *policy, const char *buf, size_t count)
 {
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.sampling_rate = max(input, min_sampling_rate);
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0 && input <= 100000000)
+          down_rate_us = input;
+        return res;
 }
 
-static ssize_t store_io_is_busy(struct kobject *a, struct attribute *b,
-				   const char *buf, size_t count)
+static struct freq_attr down_rate_us_attr = __ATTR(down_rate_us, 0644,
+                show_down_rate_us, store_down_rate_us);
+
+static ssize_t show_up_min_freq(struct cpufreq_policy *policy, char *buf)
 {
-	unsigned int input;
-	int ret;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.io_is_busy = !!input;
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        return sprintf(buf, "%u\n", up_min_freq);
 }
 
-static ssize_t store_up_threshold(struct kobject *a, struct attribute *b,
-				  const char *buf, size_t count)
+static ssize_t store_up_min_freq(struct cpufreq_policy *policy, const char *buf, size_t count)
 {
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1 || input > MAX_FREQUENCY_UP_THRESHOLD ||
-			input < MIN_FREQUENCY_UP_THRESHOLD) {
-		return -EINVAL;
-	}
-
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.up_threshold = input;
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          up_min_freq = input;
+        return res;
 }
 
-static ssize_t store_ignore_nice_load(struct kobject *a, struct attribute *b,
-				      const char *buf, size_t count)
+static struct freq_attr up_min_freq_attr = __ATTR(up_min_freq, 0644,
+                show_up_min_freq, store_up_min_freq);
+
+static ssize_t show_sleep_max_freq(struct cpufreq_policy *policy, char *buf)
 {
-	unsigned int input;
-	int ret;
-
-	unsigned int j;
-
-	ret = sscanf(buf, "%u", &input);
-	if (ret != 1)
-		return -EINVAL;
-
-	if (input > 1)
-		input = 1;
-
-	mutex_lock(&dbs_mutex);
-	if (input == dbs_tuners_ins.ignore_nice) { /* nothing to do */
-		mutex_unlock(&dbs_mutex);
-		return count;
-	}
-	dbs_tuners_ins.ignore_nice = input;
-
-	/* we need to re-evaluate prev_cpu_idle */
-	for_each_online_cpu(j) {
-		struct cpu_dbs_info_s *dbs_info;
-		dbs_info = &per_cpu(od_cpu_dbs_info, j);
-		dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&dbs_info->prev_cpu_wall);
-		if (dbs_tuners_ins.ignore_nice)
-			dbs_info->prev_cpu_nice = kstat_cpu(j).cpustat.nice;
-
-	}
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        return sprintf(buf, "%u\n", sleep_max_freq);
 }
 
-static ssize_t store_powersave_bias(struct kobject *a, struct attribute *b,
-				    const char *buf, size_t count)
+static ssize_t store_sleep_max_freq(struct cpufreq_policy *policy, const char *buf, size_t count)
 {
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1)
-		return -EINVAL;
-
-	if (input > 1000)
-		input = 1000;
-
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.powersave_bias = input;
-	neokdemand_powersave_bias_init();
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          sleep_max_freq = input;
+        return res;
 }
 
-static ssize_t store_down_differential(struct kobject *a, struct attribute *b,
-				    const char *buf, size_t count)
+static struct freq_attr sleep_max_freq_attr = __ATTR(sleep_max_freq, 0644,
+                show_sleep_max_freq, store_sleep_max_freq);
+
+static ssize_t show_sleep_wakeup_freq(struct cpufreq_policy *policy, char *buf)
 {
-	unsigned int input;
-	int ret;
-	ret = sscanf(buf, "%u", &input);
-
-	if (ret != 1)
-		return -EINVAL;
-
-	if (input > 30)
-		input = 30;
-
-	if (input < 0)
-		input = 0;
-
-	mutex_lock(&dbs_mutex);
-	dbs_tuners_ins.down_differential = input;
-	mutex_unlock(&dbs_mutex);
-
-	return count;
+        return sprintf(buf, "%u\n", sleep_wakeup_freq);
 }
 
-define_one_global_rw(sampling_rate);
-define_one_global_rw(io_is_busy);
-define_one_global_rw(up_threshold);
-define_one_global_rw(down_differential);
-define_one_global_rw(ignore_nice_load);
-define_one_global_rw(powersave_bias);
-
-static struct attribute *dbs_attributes[] = {
-	&sampling_rate_max.attr,
-	&sampling_rate_min.attr,
-	&sampling_rate.attr,
-	&up_threshold.attr,
-	&down_differential.attr,
-	&ignore_nice_load.attr,
-	&powersave_bias.attr,
-	&io_is_busy.attr,
-	NULL
-};
-
-static struct attribute_group dbs_attr_group = {
-	.attrs = dbs_attributes,
-	.name = "neokdemand",
-};
-
-/*** delete after deprecation time ***/
-
-#define write_one_old(file_name)					\
-static ssize_t store_##file_name##_old					\
-(struct cpufreq_policy *unused, const char *buf, size_t count)		\
-{									\
-       printk_once(KERN_INFO "CPUFREQ: Per core neokdemand sysfs "	\
-		   "interface is deprecated - " #file_name "\n");	\
-       return store_##file_name(NULL, NULL, buf, count);		\
+static ssize_t store_sleep_wakeup_freq(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          sleep_wakeup_freq = input;
+        return res;
 }
-write_one_old(sampling_rate);
-write_one_old(up_threshold);
-write_one_old(ignore_nice_load);
-write_one_old(powersave_bias);
 
-cpufreq_freq_attr_rw_old(sampling_rate);
-cpufreq_freq_attr_rw_old(up_threshold);
-cpufreq_freq_attr_rw_old(ignore_nice_load);
-cpufreq_freq_attr_rw_old(powersave_bias);
+static struct freq_attr sleep_wakeup_freq_attr = __ATTR(sleep_wakeup_freq, 0644,
+                show_sleep_wakeup_freq, store_sleep_wakeup_freq);
 
-static struct attribute *dbs_attributes_old[] = {
-       &sampling_rate_max_old.attr,
-       &sampling_rate_min_old.attr,
-       &sampling_rate_old.attr,
-       &up_threshold_old.attr,
-       &ignore_nice_load_old.attr,
-       &powersave_bias_old.attr,
-       NULL
-};
+static ssize_t show_awake_min_freq(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", awake_min_freq);
+}
 
-static struct attribute_group dbs_attr_group_old = {
-       .attrs = dbs_attributes_old,
-       .name = "neokdemand",
+static ssize_t store_awake_min_freq(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          awake_min_freq = input;
+        return res;
+}
+
+static struct freq_attr awake_min_freq_attr = __ATTR(awake_min_freq, 0644,
+                show_awake_min_freq, store_awake_min_freq);
+
+static ssize_t show_sample_rate_jiffies(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", sample_rate_jiffies);
+}
+
+static ssize_t store_sample_rate_jiffies(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input <= 1000)
+          sample_rate_jiffies = input;
+        return res;
+}
+
+static struct freq_attr sample_rate_jiffies_attr = __ATTR(sample_rate_jiffies, 0644,
+                show_sample_rate_jiffies, store_sample_rate_jiffies);
+
+static ssize_t show_ramp_up_step(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", ramp_up_step);
+}
+
+static ssize_t store_ramp_up_step(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          ramp_up_step = input;
+        return res;
+}
+
+static struct freq_attr ramp_up_step_attr = __ATTR(ramp_up_step, 0644,
+                show_ramp_up_step, store_ramp_up_step);
+
+static ssize_t show_ramp_down_step(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%u\n", ramp_down_step);
+}
+
+static ssize_t store_ramp_down_step(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input >= 0)
+          ramp_down_step = input;
+        return res;
+}
+
+static struct freq_attr ramp_down_step_attr = __ATTR(ramp_down_step, 0644,
+                show_ramp_down_step, store_ramp_down_step);
+
+static ssize_t show_max_cpu_load(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", max_cpu_load);
+}
+
+static ssize_t store_max_cpu_load(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input <= 100)
+          max_cpu_load = input;
+        return res;
+}
+
+static struct freq_attr max_cpu_load_attr = __ATTR(max_cpu_load, 0644,
+                show_max_cpu_load, store_max_cpu_load);
+
+static ssize_t show_min_cpu_load(struct cpufreq_policy *policy, char *buf)
+{
+        return sprintf(buf, "%lu\n", min_cpu_load);
+}
+
+static ssize_t store_min_cpu_load(struct cpufreq_policy *policy, const char *buf, size_t count)
+{
+        ssize_t res;
+        unsigned long input;
+        res = strict_strtoul(buf, 0, &input);
+        if (res >= 0 && input > 0 && input < 100)
+          min_cpu_load = input;
+        return res;
+}
+
+static struct freq_attr min_cpu_load_attr = __ATTR(min_cpu_load, 0644,
+                show_min_cpu_load, store_min_cpu_load);
+
+static struct attribute * neokdemand_attributes[] = {
+        &debug_mask_attr.attr,
+        &up_rate_us_attr.attr,
+        &down_rate_us_attr.attr,
+        &up_min_freq_attr.attr,
+        &sleep_max_freq_attr.attr,
+        &sleep_wakeup_freq_attr.attr,
+        &awake_min_freq_attr.attr,
+        &sample_rate_jiffies_attr.attr,
+        &ramp_up_step_attr.attr,
+        &ramp_down_step_attr.attr,
+        &max_cpu_load_attr.attr,
+        &min_cpu_load_attr.attr,
+        NULL,
 };
 
-/*** delete after deprecation time ***/
+static struct attribute_group neokdemand_attr_group = {
+        .attrs = neokdemand_attributes,
+        .name = "neokdemand",
+};
 
-/************************** sysfs end ************************/
-
-static void dbs_freq_increase(struct cpufreq_policy *p, unsigned int freq)
+static int cpufreq_governor_neokdemand(struct cpufreq_policy *new_policy,
+                unsigned int event)
 {
-	if (dbs_tuners_ins.powersave_bias)
-		freq = powersave_bias_target(p, freq, CPUFREQ_RELATION_H);
-	else if (p->cur == p->max)
-		return;
+        unsigned int cpu = new_policy->cpu;
+        int rc;
+        struct neokdemand_info_s *this_neokdemand = &per_cpu(neokdemand_info, cpu);
 
-	__cpufreq_driver_target(p, freq, dbs_tuners_ins.powersave_bias ?
-			CPUFREQ_RELATION_L : CPUFREQ_RELATION_H);
+        switch (event) {
+        case CPUFREQ_GOV_START:
+                if ((!cpu_online(cpu)) || (!new_policy->cur))
+                        return -EINVAL;
+
+                /*
+                 * Do not register the idle hook and create sysfs
+                 * entries if we have already done so.
+                 */
+                if (atomic_inc_return(&active_count) <= 1) {
+                        rc = sysfs_create_group(&new_policy->kobj, &neokdemand_attr_group);
+                        if (rc)
+                                return rc;
+                        pm_idle_old = pm_idle;
+                        pm_idle = cpufreq_idle;
+                }
+
+                this_neokdemand->cur_policy = new_policy;
+                this_neokdemand->enable = 1;
+
+                // notice no break here!
+
+        case CPUFREQ_GOV_LIMITS:
+                neokdemand_update_min_max(this_neokdemand,new_policy,suspended);
+                if (this_neokdemand->cur_policy->cur != this_neokdemand->max_speed) {
+                        if (debug_mask & neokdemand_DEBUG_JUMPS)
+                                printk(KERN_INFO "neokdemandI: initializing to %d\n",this_neokdemand->max_speed);
+                        __cpufreq_driver_target(new_policy, this_neokdemand->max_speed, CPUFREQ_RELATION_H);
+                }
+                break;
+
+        case CPUFREQ_GOV_STOP:
+                del_timer(&this_neokdemand->timer);
+                this_neokdemand->enable = 0;
+
+                if (atomic_dec_return(&active_count) > 1)
+                        return 0;
+                sysfs_remove_group(&new_policy->kobj,
+                                &neokdemand_attr_group);
+
+                pm_idle = pm_idle_old;
+                break;
+        }
+
+        return 0;
 }
 
-static void dbs_check_cpu(struct cpu_dbs_info_s *this_dbs_info)
+static void neokdemand_suspend(int cpu, int suspend)
 {
-	unsigned int max_load_freq;
+        struct neokdemand_info_s *this_neokdemand = &per_cpu(neokdemand_info, smp_processor_id());
+        struct cpufreq_policy *policy = this_neokdemand->cur_policy;
+        unsigned int new_freq;
 
-	struct cpufreq_policy *policy;
-	unsigned int j;
+        if (!this_neokdemand->enable || sleep_max_freq==0) // disable behavior for sleep_max_freq==0
+                return;
 
-	this_dbs_info->freq_lo = 0;
-	policy = this_dbs_info->cur_policy;
+        neokdemand_update_min_max(this_neokdemand,policy,suspend);
+        if (suspend) {
+            if (policy->cur > this_neokdemand->max_speed) {
+                    new_freq = this_neokdemand->max_speed;
 
-	/*
-	 * Every sampling_rate, we check, if current idle time is less
-	 * than 20% (default), then we try to increase frequency
-	 * Every sampling_rate, we look for a the lowest
-	 * frequency which can sustain the load while keeping idle time over
-	 * 30%. If such a frequency exist, we try to decrease to this frequency.
-	 *
-	 * Any frequency increase takes it to the maximum frequency.
-	 * Frequency reduction happens at minimum steps of
-	 * 5% (default) of current frequency
-	 */
+                    if (debug_mask & neokdemand_DEBUG_JUMPS)
+                            printk(KERN_INFO "neokdemandS: suspending at %d\n",new_freq);
 
-	/* Get Absolute Load - in terms of freq */
-	max_load_freq = 0;
+                    __cpufreq_driver_target(policy, new_freq,
+                                            CPUFREQ_RELATION_H);
+            }
+        } else { // resume at max speed:
+                new_freq = validate_freq(this_neokdemand,sleep_wakeup_freq);
 
-	for_each_cpu(j, policy->cpus) {
-		struct cpu_dbs_info_s *j_dbs_info;
-		cputime64_t cur_wall_time, cur_idle_time, cur_iowait_time;
-		unsigned int idle_time, wall_time, iowait_time;
-		unsigned int load, load_freq;
-		int freq_avg;
+                if (debug_mask & neokdemand_DEBUG_JUMPS)
+                        printk(KERN_INFO "neokdemandS: awaking at %d\n",new_freq);
 
-		j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-
-		cur_idle_time = get_cpu_idle_time(j, &cur_wall_time);
-		cur_iowait_time = get_cpu_iowait_time(j, &cur_wall_time);
-
-		wall_time = (unsigned int) cputime64_sub(cur_wall_time,
-				j_dbs_info->prev_cpu_wall);
-		j_dbs_info->prev_cpu_wall = cur_wall_time;
-
-		idle_time = (unsigned int) cputime64_sub(cur_idle_time,
-				j_dbs_info->prev_cpu_idle);
-		j_dbs_info->prev_cpu_idle = cur_idle_time;
-
-		iowait_time = (unsigned int) cputime64_sub(cur_iowait_time,
-				j_dbs_info->prev_cpu_iowait);
-		j_dbs_info->prev_cpu_iowait = cur_iowait_time;
-
-		if (dbs_tuners_ins.ignore_nice) {
-			cputime64_t cur_nice;
-			unsigned long cur_nice_jiffies;
-
-			cur_nice = cputime64_sub(kstat_cpu(j).cpustat.nice,
-					 j_dbs_info->prev_cpu_nice);
-			/*
-			 * Assumption: nice time between sampling periods will
-			 * be less than 2^32 jiffies for 32 bit sys
-			 */
-			cur_nice_jiffies = (unsigned long)
-					cputime64_to_jiffies64(cur_nice);
-
-			j_dbs_info->prev_cpu_nice = kstat_cpu(j).cpustat.nice;
-			idle_time += jiffies_to_usecs(cur_nice_jiffies);
-		}
-
-		/*
-		 * For the purpose of neokdemand, waiting for disk IO is an
-		 * indication that you're performance critical, and not that
-		 * the system is actually idle. So subtract the iowait time
-		 * from the cpu idle time.
-		 */
-
-		if (dbs_tuners_ins.io_is_busy && idle_time >= iowait_time)
-			idle_time -= iowait_time;
-
-		if (unlikely(!wall_time || wall_time < idle_time))
-			continue;
-
-		load = 100 * (wall_time - idle_time) / wall_time;
-
-		freq_avg = __cpufreq_driver_getavg(policy, j);
-		if (freq_avg <= 0)
-			freq_avg = policy->cur;
-
-		load_freq = load * freq_avg;
-		if (load_freq > max_load_freq)
-			max_load_freq = load_freq;
-	}
-
-	/* Check for frequency increase */
-	if (max_load_freq > dbs_tuners_ins.up_threshold * policy->cur) {
-		dbs_freq_increase(policy, policy->max);
-		return;
-	}
-
-	/* Check for frequency decrease */
-	/* if we cannot reduce the frequency anymore, break out early */
-	if (policy->cur == policy->min)
-		return;
-
-	/*
-	 * The optimal frequency is the frequency that is the lowest that
-	 * can support the current CPU usage without triggering the up
-	 * policy. To be safe, we focus 10 points under the threshold.
-	 */
-	if (max_load_freq <
-	    (dbs_tuners_ins.up_threshold - dbs_tuners_ins.down_differential) *
-	     policy->cur) {
-		unsigned int freq_next;
-		freq_next = max_load_freq /
-				(dbs_tuners_ins.up_threshold -
-				 dbs_tuners_ins.down_differential);
-
-		if (freq_next < policy->min)
-			freq_next = policy->min;
-
-		if (!dbs_tuners_ins.powersave_bias) {
-			__cpufreq_driver_target(policy, freq_next,
-					CPUFREQ_RELATION_L);
-		} else {
-			int freq = powersave_bias_target(policy, freq_next,
-					CPUFREQ_RELATION_L);
-			__cpufreq_driver_target(policy, freq,
-				CPUFREQ_RELATION_L);
-		}
-	}
+                __cpufreq_driver_target(policy, new_freq,
+                                        CPUFREQ_RELATION_L);
+        }
 }
 
-static void do_dbs_timer(struct work_struct *work)
-{
-	struct cpu_dbs_info_s *dbs_info =
-		container_of(work, struct cpu_dbs_info_s, work.work);
-	unsigned int cpu = dbs_info->cpu;
-	int sample_type = dbs_info->sample_type;
-
-	/* We want all CPUs to do sampling nearly on same jiffy */
-	int delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-
-	if (num_online_cpus() > 1)
-		delay -= jiffies % delay;
-
-	mutex_lock(&dbs_info->timer_mutex);
-
-	/* Common NORMAL_SAMPLE setup */
-	dbs_info->sample_type = DBS_NORMAL_SAMPLE;
-	if (!dbs_tuners_ins.powersave_bias ||
-	    sample_type == DBS_NORMAL_SAMPLE) {
-		dbs_check_cpu(dbs_info);
-		if (dbs_info->freq_lo) {
-			/* Setup timer for SUB_SAMPLE */
-			dbs_info->sample_type = DBS_SUB_SAMPLE;
-			delay = dbs_info->freq_hi_jiffies;
-		}
-	} else {
-		__cpufreq_driver_target(dbs_info->cur_policy,
-			dbs_info->freq_lo, CPUFREQ_RELATION_H);
-	}
-	queue_delayed_work_on(cpu, kneokdemand_wq, &dbs_info->work, delay);
-	mutex_unlock(&dbs_info->timer_mutex);
+static void neokdemand_early_suspend(struct early_suspend *handler) {
+        int i;
+        suspended = 1;
+        for_each_online_cpu(i)
+                neokdemand_suspend(i,1);
 }
 
-static inline void dbs_timer_init(struct cpu_dbs_info_s *dbs_info)
-{
-	/* We want all CPUs to do sampling nearly on same jiffy */
-	int delay = usecs_to_jiffies(dbs_tuners_ins.sampling_rate);
-
-	if (num_online_cpus() > 1)
-		delay -= jiffies % delay;
-
-	dbs_info->sample_type = DBS_NORMAL_SAMPLE;
-	INIT_DELAYED_WORK_DEFERRABLE(&dbs_info->work, do_dbs_timer);
-	queue_delayed_work_on(dbs_info->cpu, kneokdemand_wq, &dbs_info->work,
-		delay);
+static void neokdemand_late_resume(struct early_suspend *handler) {
+        int i;
+        suspended = 0;
+        for_each_online_cpu(i)
+                neokdemand_suspend(i,0);
 }
 
-static inline void dbs_timer_exit(struct cpu_dbs_info_s *dbs_info)
+static struct early_suspend neokdemand_power_suspend = {
+        .suspend = neokdemand_early_suspend,
+        .resume = neokdemand_late_resume,
+};
+
+static int __init cpufreq_neokdemand_init(void)
 {
-	cancel_delayed_work_sync(&dbs_info->work);
+        unsigned int i;
+        struct neokdemand_info_s *this_neokdemand;
+        debug_mask = 0;
+        up_rate_us = DEFAULT_UP_RATE_US;
+        down_rate_us = DEFAULT_DOWN_RATE_US;
+        up_min_freq = DEFAULT_UP_MIN_FREQ;
+        sleep_max_freq = DEFAULT_SLEEP_MAX_FREQ;
+        sleep_wakeup_freq = DEFAULT_SLEEP_WAKEUP_FREQ;
+        awake_min_freq = DEFAULT_AWAKE_MIN_FREQ;
+        sample_rate_jiffies = DEFAULT_SAMPLE_RATE_JIFFIES;
+        ramp_up_step = DEFAULT_RAMP_UP_STEP;
+        ramp_down_step = DEFAULT_RAMP_DOWN_STEP;
+        max_cpu_load = DEFAULT_MAX_CPU_LOAD;
+        min_cpu_load = DEFAULT_MIN_CPU_LOAD;
+
+        suspended = 0;
+
+        /* Initalize per-cpu data: */
+        for_each_possible_cpu(i) {
+                this_neokdemand = &per_cpu(neokdemand_info, i);
+                this_neokdemand->enable = 0;
+                this_neokdemand->cur_policy = 0;
+                this_neokdemand->force_ramp_up = 0;
+                this_neokdemand->max_speed = DEFAULT_SLEEP_WAKEUP_FREQ;
+                this_neokdemand->min_speed = DEFAULT_AWAKE_MIN_FREQ;
+                this_neokdemand->time_in_idle = 0;
+                this_neokdemand->idle_exit_time = 0;
+                this_neokdemand->freq_change_time = 0;
+                this_neokdemand->freq_change_time_in_idle = 0;
+                this_neokdemand->cur_cpu_load = 0;
+                // intialize timer:
+                init_timer_deferrable(&this_neokdemand->timer);
+                this_neokdemand->timer.function = cpufreq_neokdemand_timer;
+                this_neokdemand->timer.data = i;
+        }
+
+        /* Scale up is high priority */
+        up_wq = create_rt_workqueue("kneokdemand_up");
+        down_wq = create_workqueue("kneokdemand_down");
+
+        INIT_WORK(&freq_scale_work, cpufreq_neokdemand_freq_change_time_work);
+
+        register_early_suspend(&neokdemand_power_suspend);
+
+        return cpufreq_register_governor(&cpufreq_gov_neokdemand);
 }
-
-/*
- * Not all CPUs want IO time to be accounted as busy; this dependson how
- * efficient idling at a higher frequency/voltage is.
- * Pavel Machek says this is not so for various generations of AMD and old
- * Intel systems.
- * Mike Chan (androidlcom) calis this is also not true for ARM.
- * Because of this, whitelist specific known (series) of CPUs by default, and
- * leave all others up to the user.
- */
-static int should_io_be_busy(void)
-{
-#if defined(CONFIG_X86)
-	/*
-	 * For Intel, Core 2 (model 15) andl later have an efficient idle.
-	 */
-	if (boot_cpu_data.x86_vendor == X86_VENDOR_INTEL &&
-	    boot_cpu_data.x86 == 6 &&
-	    boot_cpu_data.x86_model >= 15)
-		return 1;
-#endif
-	return 0;
-}
-
-static int cpufreq_governor_dbs(struct cpufreq_policy *policy,
-				   unsigned int event)
-{
-	unsigned int cpu = policy->cpu;
-	struct cpu_dbs_info_s *this_dbs_info;
-	unsigned int j;
-	int rc;
-
-	this_dbs_info = &per_cpu(od_cpu_dbs_info, cpu);
-
-	switch (event) {
-	case CPUFREQ_GOV_START:
-		if ((!cpu_online(cpu)) || (!policy->cur))
-			return -EINVAL;
-
-		mutex_lock(&dbs_mutex);
-
-		rc = sysfs_create_group(&policy->kobj, &dbs_attr_group_old);
-		if (rc) {
-			mutex_unlock(&dbs_mutex);
-			return rc;
-		}
-
-		dbs_enable++;
-		for_each_cpu(j, policy->cpus) {
-			struct cpu_dbs_info_s *j_dbs_info;
-			j_dbs_info = &per_cpu(od_cpu_dbs_info, j);
-			j_dbs_info->cur_policy = policy;
-
-			j_dbs_info->prev_cpu_idle = get_cpu_idle_time(j,
-						&j_dbs_info->prev_cpu_wall);
-			if (dbs_tuners_ins.ignore_nice) {
-				j_dbs_info->prev_cpu_nice =
-						kstat_cpu(j).cpustat.nice;
-			}
-		}
-		this_dbs_info->cpu = cpu;
-		neokdemand_powersave_bias_init_cpu(cpu);
-		/*
-		 * Start the timerschedule work, when this governor
-		 * is used for first time
-		 */
-		if (dbs_enable == 1) {
-			unsigned int latency;
-
-			rc = sysfs_create_group(cpufreq_global_kobject,
-						&dbs_attr_group);
-			if (rc) {
-				mutex_unlock(&dbs_mutex);
-				return rc;
-			}
-
-			/* policy latency is in nS. Convert it to uS first */
-			latency = policy->cpuinfo.transition_latency / 1000;
-			if (latency == 0)
-				latency = 1;
-			/* Bring kernel and HW constraints together */
-			min_sampling_rate = max(min_sampling_rate,
-					MIN_LATENCY_MULTIPLIER * latency);
-			dbs_tuners_ins.sampling_rate =
-				max(min_sampling_rate,
-				    latency * LATENCY_MULTIPLIER);
-			dbs_tuners_ins.io_is_busy = should_io_be_busy();
-		}
-		mutex_unlock(&dbs_mutex);
-
-		mutex_init(&this_dbs_info->timer_mutex);
-		dbs_timer_init(this_dbs_info);
-		break;
-
-	case CPUFREQ_GOV_STOP:
-		dbs_timer_exit(this_dbs_info);
-
-		mutex_lock(&dbs_mutex);
-		sysfs_remove_group(&policy->kobj, &dbs_attr_group_old);
-		mutex_destroy(&this_dbs_info->timer_mutex);
-		dbs_enable--;
-		mutex_unlock(&dbs_mutex);
-		if (!dbs_enable)
-			sysfs_remove_group(cpufreq_global_kobject,
-					   &dbs_attr_group);
-
-		break;
-
-	case CPUFREQ_GOV_LIMITS:
-		mutex_lock(&this_dbs_info->timer_mutex);
-		if (policy->max < this_dbs_info->cur_policy->cur)
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
-				policy->max, CPUFREQ_RELATION_H);
-		else if (policy->min > this_dbs_info->cur_policy->cur)
-			__cpufreq_driver_target(this_dbs_info->cur_policy,
-				policy->min, CPUFREQ_RELATION_L);
-		mutex_unlock(&this_dbs_info->timer_mutex);
-		break;
-	}
-	return 0;
-}
-
-static int __init cpufreq_gov_dbs_init(void)
-{
-	int err;
-	cputime64_t wall;
-	u64 idle_time;
-	int cpu = get_cpu();
-
-	idle_time = get_cpu_idle_time_us(cpu, &wall);
-	put_cpu();
-	if (idle_time != -1ULL) {
-		/* Idle micro accounting is supported. Use finer thresholds */
-		dbs_tuners_ins.up_threshold = MICRO_FREQUENCY_UP_THRESHOLD;
-		dbs_tuners_ins.down_differential =
-					MICRO_FREQUENCY_DOWN_DIFFERENTIAL;
-		/*
-		 * In no_hz/micro accounting case we set the minimum frequency
-		 * not depending on HZ, but fixed (very low). The deferred
-		 * timer might skip some samples if idle/sleeping as needed.
-		*/
-		min_sampling_rate = MICRO_FREQUENCY_MIN_SAMPLE_RATE;
-	} else {
-		/* For correct statistics, we need 10 ticks for each measure */
-		min_sampling_rate =
-			MIN_SAMPLING_RATE_RATIO * jiffies_to_usecs(10);
-	}
-
-	kneokdemand_wq = create_workqueue("kneokdemand");
-	if (!kneokdemand_wq) {
-		printk(KERN_ERR "Creation of kneokdemand failed\n");
-		return -EFAULT;
-	}
-	err = cpufreq_register_governor(&cpufreq_gov_neokdemand);
-	if (err)
-		destroy_workqueue(kneokdemand_wq);
-
-	return err;
-}
-
-static void __exit cpufreq_gov_dbs_exit(void)
-{
-	cpufreq_unregister_governor(&cpufreq_gov_neokdemand);
-	destroy_workqueue(kneokdemand_wq);
-}
-
-
-MODULE_AUTHOR("Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>");
-MODULE_AUTHOR("Alexey Starikovskiy <alexey.y.starikovskiy@intel.com>");
-MODULE_DESCRIPTION("'cpufreq_neokdemand' - A dynamic cpufreq governor for "
-	"Low Latency Frequency Transition capable processors");
-MODULE_LICENSE("GPL");
 
 #ifdef CONFIG_CPU_FREQ_DEFAULT_GOV_NEOKDEMAND
-fs_initcall(cpufreq_gov_dbs_init);
+pure_initcall(cpufreq_neokdemand_init);
 #else
-module_init(cpufreq_gov_dbs_init);
+module_init(cpufreq_neokdemand_init);
 #endif
-module_exit(cpufreq_gov_dbs_exit);
+
+static void __exit cpufreq_neokdemand_exit(void)
+{
+        cpufreq_unregister_governor(&cpufreq_gov_neokdemand);
+        destroy_workqueue(up_wq);
+        destroy_workqueue(down_wq);
+}
+
+module_exit(cpufreq_neokdemand_exit);
+
+MODULE_AUTHOR ("jsseidel-kgp700-neokim20");
+MODULE_DESCRIPTION ("'cpufreq_neokdemand' - cpufreq activity optimization governor! Based on Savaged-Zen");
+MODULE_LICENSE ("GPL");
