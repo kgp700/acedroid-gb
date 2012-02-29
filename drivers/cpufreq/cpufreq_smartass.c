@@ -62,14 +62,14 @@ static unsigned int suspended;
  * The minimum amount of time to spend at a frequency before we can ramp down,
  * default is 45ms.
  */
-#define DEFAULT_DOWN_RATE_US 40000;
+#define DEFAULT_DOWN_RATE_US 70000;
 static unsigned long down_rate_us;
 
 /*
  * When ramping up frequency with no idle cycles jump to at least this frequency.
  * Zero disables. Set a very high value to jump to policy max freqeuncy.
  */
-#define DEFAULT_UP_MIN_FREQ 999999
+#define DEFAULT_UP_MIN_FREQ 652800
 static unsigned int up_min_freq;
 
 /*
@@ -84,14 +84,14 @@ static unsigned int sleep_max_freq;
 /*
  * Sampling rate, I highly recommend to leave it at 2.
  */
-#define DEFAULT_SAMPLE_RATE_JIFFIES 2
+#define DEFAULT_SAMPLE_RATE_JIFFIES 10
 static unsigned int sample_rate_jiffies;
 
 /*
  * Freqeuncy delta when ramping up.
  * zero disables causes to always jump straight to max frequency.
  */
-#define DEFAULT_RAMP_UP_STEP 128000
+#define DEFAULT_RAMP_UP_STEP 200000
 static unsigned int ramp_up_step;
 
 /*
@@ -103,13 +103,13 @@ static unsigned int max_ramp_down;
 /*
  * CPU freq will be increased if measured load > max_cpu_load;
  */
-#define DEFAULT_MAX_CPU_LOAD 75
+#define DEFAULT_MAX_CPU_LOAD 60
 static unsigned long max_cpu_load;
 
 /*
  * CPU freq will be decreased if measured load < min_cpu_load;
  */
-#define DEFAULT_MIN_CPU_LOAD 35
+#define DEFAULT_MIN_CPU_LOAD 30
 static unsigned long min_cpu_load;
 
 
