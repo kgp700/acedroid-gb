@@ -118,7 +118,7 @@ static unsigned int awake_min_freq;
 /*
  * Sampling rate, I highly recommend to leave it at 2.
  */
-#define DEFAULT_SAMPLE_RATE_JIFFIES 20
+#define DEFAULT_SAMPLE_RATE_JIFFIES 22
 static unsigned int sample_rate_jiffies;
 
 /*
@@ -138,7 +138,7 @@ static unsigned int ramp_down_step;
 /*
  * CPU freq will be increased if measured load > max_cpu_load;
  */
-#define DEFAULT_MAX_CPU_LOAD 40
+#define DEFAULT_MAX_CPU_LOAD 42
 static unsigned long max_cpu_load;
 
 /*
