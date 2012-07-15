@@ -336,8 +336,8 @@ MODFLAGS	= -DMODULE
 CFLAGS_MODULE   = $(MODFLAGS)
 AFLAGS_MODULE   = $(MODFLAGS)
 LDFLAGS_MODULE  = -T $(srctree)/scripts/module-common.lds
-CFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fsingle-precision-constant -ftree-vectorize -funswitch-loops -fforce-addr -fprofile-correction -falign-loops -fpredictive-commoning -fgcse-after-reload -pipe
-AFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fsingle-precision-constant -ftree-vectorize -funswitch-loops -fforce-addr -fprofile-correction -falign-loops -fpredictive-commoning -fgcse-after-reload -pipe
+CFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fno-gcse -fsingle-precision-constant -funswitch-loops -fprofile-correction -falign-loops -fipa-cp-clone -pipe
+AFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -fno-gcse -fsingle-precision-constant -funswitch-loops -fprofile-correction -falign-loops -fipa-cp-clone -pipe
 CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage
 
 
@@ -355,9 +355,9 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Wno-format-security \
 		   -fno-delete-null-pointer-checks \
 		   -mtune=cortex-a8 -march=armv7-a -mfpu=neon -mfloat-abi=hard \
-		   -fsingle-precision-constant -ftree-vectorize -funswitch-loops \
-		   -fforce-addr -fprofile-correction -falign-loops \
-	   	   -fpredictive-commoning -fgcse-after-reload -pipe
+		   -fno-gcse -fsingle-precision-constant -funswitch-loops \
+		   -fprofile-correction -falign-loops -fipa-cp-clone \
+		   -pipe -mthumb -mthumb-interwork
 KBUILD_AFLAGS   := -D__ASSEMBLY__
 
 # Read KERNELRELEASE from include/config/kernel.release (if it exists)
