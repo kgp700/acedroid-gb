@@ -104,7 +104,7 @@ static unsigned int sleep_max_freq;
  * The frequency to set when waking up from sleep.
  * When sleep_max_freq=0 this will have no effect.
  */
-#define DEFAULT_SLEEP_WAKEUP_FREQ 998000
+#define DEFAULT_SLEEP_WAKEUP_FREQ 804000
 static unsigned int sleep_wakeup_freq;
 
 /*
@@ -125,7 +125,7 @@ static unsigned int sample_rate_jiffies;
  * Freqeuncy delta when ramping up.
  * zero disables and causes to always jump straight to max frequency.
  */
-#define DEFAULT_RAMP_UP_STEP 800000
+#define DEFAULT_RAMP_UP_STEP 245000
 static unsigned int ramp_up_step;
 
 /*
@@ -138,13 +138,13 @@ static unsigned int ramp_down_step;
 /*
  * CPU freq will be increased if measured load > max_cpu_load;
  */
-#define DEFAULT_MAX_CPU_LOAD 42
+#define DEFAULT_MAX_CPU_LOAD 87
 static unsigned long max_cpu_load;
 
 /*
  * CPU freq will be decreased if measured load < min_cpu_load;
  */
-#define DEFAULT_MIN_CPU_LOAD 30
+#define DEFAULT_MIN_CPU_LOAD 70
 static unsigned long min_cpu_load;
 
 
@@ -721,7 +721,7 @@ static int __init cpufreq_neokdemand_init(void)
 
         /* Scale up is high priority */
         up_wq = create_rt_workqueue("kneokdemand_up");
-        down_wq = create_workqueue("kneokdemand_down");
+        down_wq = create_rt_workqueue("kneokdemand_down");
 
         INIT_WORK(&freq_scale_work, cpufreq_neokdemand_freq_change_time_work);
 
