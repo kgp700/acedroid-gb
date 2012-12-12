@@ -336,8 +336,8 @@ MODFLAGS	= -DMODULE
 CFLAGS_MODULE   = $(MODFLAGS)
 AFLAGS_MODULE   = $(MODFLAGS)
 LDFLAGS_MODULE  = -T $(srctree)/scripts/module-common.lds
-CFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -ftree-vectorize -fno-gcse -mvectorize-with-neon-quad -fsingle-precision-constant -funswitch-loops -fprofile-correction -funsafe-math-optimizations -fipa-cp-clone -fgraphite -fgraphite-identity -floop-interchange -floop-strip-mine -floop-block -pipe
-AFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -ftree-vectorize -fno-gcse -mvectorize-with-neon-quad -fsingle-precision-constant -funswitch-loops -fprofile-correction -funsafe-math-optimizations -fipa-cp-clone -fgraphite -fgraphite-identity -floop-interchange -floop-strip-mine -floop-block -pipe
+CFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -ftree-vectorize -fno-gcse -fsingle-precision-constant -funswitch-loops -fprofile-correction -funsafe-math-optimizations -fipa-cp-clone -fgraphite-identity -floop-interchange -floop-strip-mine -floop-block -pipe
+AFLAGS_KERNEL	= -mtune=cortex-a8 -march=armv7-a -mfpu=neon -ftree-vectorize -fno-gcse -fsingle-precision-constant -funswitch-loops -fprofile-correction -funsafe-math-optimizations -fipa-cp-clone -fgraphite-identity -floop-interchange -floop-strip-mine -floop-block -pipe
 CFLAGS_GCOV	= -fprofile-arcs -ftest-coverage
 
 
@@ -354,8 +354,8 @@ KBUILD_CFLAGS   := -Wall -Wundef -Wstrict-prototypes -Wno-trigraphs \
 		   -Werror-implicit-function-declaration \
 		   -Wno-format-security \
 		   -fno-delete-null-pointer-checks \
-		   -mtune=cortex-a8 -march=armv7-a -mfpu=neon -mfloat-abi=softfp \
-		   -fno-gcse -mvectorize-with-neon-quad -ftree-vectorize -fsingle-precision-constant -funswitch-loops \
+		   -mtune=cortex-a8 -march=armv7-a -mfpu=neon -mfloat-abi=hard \
+		   -fno-gcse -ftree-vectorize -fsingle-precision-constant -funswitch-loops \
 		   -fprofile-correction -funsafe-math-optimizations -fipa-cp-clone \
 		   -fgraphite -fgraphite-identity -floop-interchange -floop-strip-mine \
 		   -floop-block -pipe -mthumb 
